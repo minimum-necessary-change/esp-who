@@ -17,7 +17,7 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
-#include "camera_index.h"
+//#include "camera_index.h"
 #include "sdkconfig.h"
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
@@ -30,7 +30,6 @@ static const char* TAG = "camera_httpd";
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
 #include "fd_forward.h"
-#include "dl_lib.h"
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
 #include "fr_forward.h"
 
@@ -75,8 +74,7 @@ static int8_t detection_enabled = 0;
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
 static int8_t recognition_enabled = 0;
 static int8_t is_enrolling = 0;
-static int32_t next_enroll_index = 0;
-static dl_matrix3d_t *id_list[FACE_ID_SAVE_NUMBER] = {0};
+static face_id_list id_list = {0};
 #endif
 #endif
 static ra_filter_t ra_filter;
@@ -195,31 +193,21 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
         return matched_id;
     }
     if (align_face(net_boxes, image_matrix, aligned_face) == ESP_OK){
-        if ((is_enrolling == 1) && (next_enroll_index < FACE_ID_SAVE_NUMBER)) {
-            if (id_list[next_enroll_index] == NULL) {
-                id_list[next_enroll_index] = dl_matrix3d_alloc(1, 1, 1, FACE_ID_SIZE);
-                if(!id_list[next_enroll_index]){
-                    ESP_LOGE(TAG, "Could not allocate id_list");
-                    dl_matrix3du_free(aligned_face);
-                    return matched_id;
-                }
-            }
-
-            int8_t left_sample_face = enroll(aligned_face, id_list[next_enroll_index], ENROLL_CONFIRM_TIMES);
+        if (is_enrolling == 1){
+            int8_t left_sample_face = enroll_face(&id_list, aligned_face);
 
             if(left_sample_face == (ENROLL_CONFIRM_TIMES - 1)){
-                ESP_LOGD(TAG, "Enrolling Face ID: %d", next_enroll_index+1);
+                ESP_LOGD(TAG, "Enrolling Face ID: %d", id_list.tail);
             }
-            ESP_LOGD(TAG, "Enrolling Face ID: %d sample %d", next_enroll_index+1, ENROLL_CONFIRM_TIMES - left_sample_face);
-            rgb_printf(image_matrix, FACE_COLOR_CYAN, "ID[%u] Sample[%u]", next_enroll_index+1, ENROLL_CONFIRM_TIMES - left_sample_face);
+            ESP_LOGD(TAG, "Enrolling Face ID: %d sample %d", id_list.tail, ENROLL_CONFIRM_TIMES - left_sample_face);
+            rgb_printf(image_matrix, FACE_COLOR_CYAN, "ID[%u] Sample[%u]", id_list.tail, ENROLL_CONFIRM_TIMES - left_sample_face);
             if (left_sample_face == 0){
-                next_enroll_index++;
                 is_enrolling = 0;
-                ESP_LOGD(TAG, "Enrolled Face ID: %d", next_enroll_index);
+                ESP_LOGD(TAG, "Enrolled Face ID: %d", id_list.tail);
             }
         } else {
-            matched_id = recognize_face(aligned_face, id_list, FACE_REC_THRESHOLD, next_enroll_index);
-            if (matched_id) {
+            matched_id = recognize_face(&id_list, aligned_face);
+            if (matched_id >= 0) {
                 ESP_LOGW(TAG, "Match Face ID: %u", matched_id);
                 rgb_printf(image_matrix, FACE_COLOR_GREEN, "Hello Subject %u", matched_id);
             } else {
@@ -264,6 +252,7 @@ static esp_err_t capture_handler(httpd_req_t *req){
 
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
     size_t out_len, out_width, out_height;
@@ -322,6 +311,7 @@ static esp_err_t capture_handler(httpd_req_t *req){
         }
 #endif
         draw_face_boxes(image_matrix, net_boxes, face_id);
+        free(net_boxes->score);
         free(net_boxes->box);
         free(net_boxes->landmark);
         free(net_boxes);
@@ -367,6 +357,8 @@ static esp_err_t stream_handler(httpd_req_t *req){
     if(res != ESP_OK){
         return res;
     }
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     while(true){
 #if CONFIG_ESP_FACE_DETECT_ENABLED
@@ -428,13 +420,13 @@ static esp_err_t stream_handler(httpd_req_t *req){
                                 fr_recognize = esp_timer_get_time();
 #endif
                                 draw_face_boxes(image_matrix, net_boxes, face_id);
+                                free(net_boxes->score);
                                 free(net_boxes->box);
                                 free(net_boxes->landmark);
                                 free(net_boxes);
                             }
                             if(!fmt2jpg(image_matrix->item, fb->width*fb->height*3, fb->width, fb->height, PIXFORMAT_RGB888, 90, &_jpg_buf, &_jpg_buf_len)){
                                 ESP_LOGE(TAG, "fmt2jpg failed");
-                                res = ESP_FAIL;
                             }
                             esp_camera_fb_return(fb);
                             fb = NULL;
@@ -609,6 +601,7 @@ static esp_err_t status_handler(httpd_req_t *req){
     p+=sprintf(p, "\"brightness\":%d,", s->status.brightness);
     p+=sprintf(p, "\"contrast\":%d,", s->status.contrast);
     p+=sprintf(p, "\"saturation\":%d,", s->status.saturation);
+    p+=sprintf(p, "\"sharpness\":%d,", s->status.sharpness);
     p+=sprintf(p, "\"special_effect\":%u,", s->status.special_effect);
     p+=sprintf(p, "\"wb_mode\":%u,", s->status.wb_mode);
     p+=sprintf(p, "\"awb\":%u,", s->status.awb);
@@ -643,9 +636,22 @@ static esp_err_t status_handler(httpd_req_t *req){
 }
 
 static esp_err_t index_handler(httpd_req_t *req){
+    extern const unsigned char index_ov2640_html_gz_start[] asm("_binary_index_ov2640_html_gz_start");
+    extern const unsigned char index_ov2640_html_gz_end[]   asm("_binary_index_ov2640_html_gz_end");
+    size_t index_ov2640_html_gz_len = index_ov2640_html_gz_end - index_ov2640_html_gz_start;
+
+    extern const unsigned char index_ov3660_html_gz_start[] asm("_binary_index_ov3660_html_gz_start");
+    extern const unsigned char index_ov3660_html_gz_end[]   asm("_binary_index_ov3660_html_gz_end");
+    size_t index_ov3660_html_gz_len = index_ov3660_html_gz_end - index_ov3660_html_gz_start;
+
+
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-    return httpd_resp_send(req, (const char *)index_html_gz, index_html_gz_len);
+    sensor_t * s = esp_camera_sensor_get();
+    if (s->id.PID == OV3660_PID) {
+        return httpd_resp_send(req, (const char *)index_ov3660_html_gz_start, index_ov3660_html_gz_len);
+    }
+    return httpd_resp_send(req, (const char *)index_ov2640_html_gz_start, index_ov2640_html_gz_len);
 }
 
 void app_httpd_main(){
@@ -689,16 +695,22 @@ void app_httpd_main(){
 
     ra_filter_init(&ra_filter, 20);
 #if CONFIG_ESP_FACE_DETECT_ENABLED
+    mtmn_config.type = FAST;
     mtmn_config.min_face = 80;
-    mtmn_config.pyramid = 0.7;
+    mtmn_config.pyramid = 0.707;
+    mtmn_config.pyramid_times = 4;
     mtmn_config.p_threshold.score = 0.6;
     mtmn_config.p_threshold.nms = 0.7;
+    mtmn_config.p_threshold.candidate_number = 20;
     mtmn_config.r_threshold.score = 0.7;
     mtmn_config.r_threshold.nms = 0.7;
-    mtmn_config.r_threshold.candidate_number = 4;
+    mtmn_config.r_threshold.candidate_number = 10;
     mtmn_config.o_threshold.score = 0.7;
-    mtmn_config.o_threshold.nms = 0.4;
+    mtmn_config.o_threshold.nms = 0.7;
     mtmn_config.o_threshold.candidate_number = 1;
+#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
+    face_id_init(&id_list, FACE_ID_SAVE_NUMBER, ENROLL_CONFIRM_TIMES);
+#endif
 #endif
     ESP_LOGI(TAG, "Starting web server on port: '%d'", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {

@@ -25,6 +25,12 @@ config ESP_WIFI_AP_PASSWORD
     help
 	AP password for WPA2 or empty for Open.
 
+config SERVER_IP
+    string "WiFi AP IP Address"
+    default "192.168.4.1"
+    help
+        IP address that the ESP will assign to it's AP interface. You can use this IP to connect to the camera after flashing.
+
 config ESP_MAXIMUM_RETRY
     int "Maximum retry"
     default 5
@@ -41,8 +47,14 @@ choice CAMERA_MODEL
 
 config CAMERA_MODEL_WROVER_KIT
     bool "WROVER-KIT With OV2640 Module"
+config CAMERA_MODEL_ESP_EYE
+    bool "ESP_EYE DevKit"
 config CAMERA_MODEL_M5STACK_PSRAM
     bool "M5Stack Camera With PSRAM"
+config CAMERA_MODEL_M5STACK_WIDE
+    bool "M5Stack Camera F (Wide)"
+config CAMERA_MODEL_AI_THINKER
+    bool "ESP32-CAM by AI-Thinker"
 config CAMERA_MODEL_CUSTOM
     bool "Custom Camera Pinout"
 endchoice

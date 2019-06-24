@@ -19,12 +19,10 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+
 #include "app_camera.h"
 
 static const char *TAG = "app_camera";
-
-QueueHandle_t gpst_input_queue = NULL;
-TaskHandle_t gpst_input_task = NULL;
 
 void app_camera_init()
 {
@@ -45,6 +43,7 @@ void app_camera_init()
     config.pin_href = HREF_GPIO_NUM;
     config.pin_sscb_sda = SIOD_GPIO_NUM;
     config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = -1;//RESET_GPIO_NUM;
     config.xclk_freq_hz = XCLK_FREQ;
     config.pixel_format = CAMERA_PIXEL_FORMAT;
@@ -58,6 +57,4 @@ void app_camera_init()
         ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
         return;
     }
-
-    vTaskDelay(200 / portTICK_PERIOD_MS);
 }

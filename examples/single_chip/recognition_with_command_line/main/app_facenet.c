@@ -27,10 +27,12 @@
 #include "freertos/queue.h"
 #include "app_facenet.h"
 #include "sdkconfig.h"
-#include "dl_lib.h"
 
 static const char *TAG = "app_process";
 
+#define ENROLL_CONFIRM_TIMES 3
+#define FACE_ID_SAVE_NUMBER 1
+static face_id_list id_list = {0};
 char *number_suffix(int32_t number)
 {
     uint8_t n = number % 10;
@@ -50,15 +52,18 @@ char *number_suffix(int32_t number)
 mtmn_config_t init_config()
 {
     mtmn_config_t mtmn_config = {0};
+    mtmn_config.type = FAST;
     mtmn_config.min_face = 80;
-    mtmn_config.pyramid = 0.7;
+    mtmn_config.pyramid = 0.707;
+    mtmn_config.pyramid_times = 4;
     mtmn_config.p_threshold.score = 0.6;
     mtmn_config.p_threshold.nms = 0.7;
+    mtmn_config.p_threshold.candidate_number = 20;
     mtmn_config.r_threshold.score = 0.7;
     mtmn_config.r_threshold.nms = 0.7;
-    mtmn_config.r_threshold.candidate_number = 4;
+    mtmn_config.r_threshold.candidate_number = 10;
     mtmn_config.o_threshold.score = 0.7;
-    mtmn_config.o_threshold.nms = 0.4;
+    mtmn_config.o_threshold.nms = 0.7;
     mtmn_config.o_threshold.candidate_number = 1;
 
     return mtmn_config;
@@ -69,16 +74,15 @@ void task_process(void *arg)
     size_t frame_num = 0;
     dl_matrix3du_t *image_matrix = NULL;
     camera_fb_t *fb = NULL;
+
+    /* 1. Load configuration for detection */
     mtmn_config_t mtmn_config = init_config();
 
+    /* 2. Preallocate matrix to store aligned face 56x56  */
     dl_matrix3du_t *aligned_face = dl_matrix3du_alloc(1,
                                                       FACE_WIDTH,
                                                       FACE_HEIGHT,
                                                       3);
-
-
-    fptp_t thresh = FACE_REC_THRESHOLD;
-    dl_matrix3d_t *id_list[FACE_ID_SAVE_NUMBER] = {0};
 
     int8_t count_down_second = 3; //second
     int8_t is_enrolling = 1;
@@ -88,6 +92,7 @@ void task_process(void *arg)
     do
     {
         int64_t start_time = esp_timer_get_time();
+        /* 3. Get one image with camera */
         fb = esp_camera_fb_get();
         if (!fb)
         {
@@ -97,80 +102,81 @@ void task_process(void *arg)
         int64_t fb_get_time = esp_timer_get_time();
         ESP_LOGI(TAG, "Get one frame in %lld ms.", (fb_get_time - start_time) / 1000);
 
+        /* 4. Allocate image matrix to store RGB data */
         image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
+
+        /* 5. Transform image to RGB */
         uint32_t res = fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item);
         if (true != res)
         {
             ESP_LOGE(TAG, "fmt2rgb888 failed, fb: %d", fb->len);
+            dl_matrix3du_free(image_matrix);
             continue;
         }
 
         esp_camera_fb_return(fb);
 
+        /* 6. Do face detection */
         box_array_t *net_boxes = face_detect(image_matrix, &mtmn_config);
         ESP_LOGI(TAG, "Detection time consumption: %lldms", (esp_timer_get_time() - fb_get_time) / 1000);
 
         if (net_boxes)
         {
             frame_num++;
-            ESP_LOGI(TAG, "Face Detection Count: %d", frame_num);
+            //ESP_LOGI(TAG, "Face Detection Count: %d", frame_num);
 
+            /* 5. Do face alignment */
             if (align_face(net_boxes, image_matrix, aligned_face) == ESP_OK)
             {
                 //count down
                 while (count_down_second > 0)
                 {
-                    ESP_LOGE(TAG, "Face ID Enrollment Starts in %ds.", count_down_second);
+                    ESP_LOGI(TAG, "Face ID Enrollment Starts in %ds.\n", count_down_second);
 
                     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
                     count_down_second--;
 
                     if (count_down_second == 0)
-                        ESP_LOGE(TAG, ">>> Face ID Enrollment Starts <<<");
+                        ESP_LOGI(TAG, "\n>>> Face ID Enrollment Starts <<<\n");
                 }
 
-                //enroll
-                if ((is_enrolling == 1) && (next_enroll_index < FACE_ID_SAVE_NUMBER))
+                /* 6. Do face enrollment */
+                if (is_enrolling == 1)
                 {
-                    if (id_list[next_enroll_index] == NULL)
-                        id_list[next_enroll_index] = dl_matrix3d_alloc(1, 1, 1, FACE_ID_SIZE);
-
-                    left_sample_face = enroll(aligned_face, id_list[next_enroll_index], ENROLL_CONFIRM_TIMES);
-                    ESP_LOGE(TAG, "Face ID Enrollment: Take the %d%s sample",
+                    left_sample_face = enroll_face(&id_list, aligned_face);
+                    ESP_LOGI(TAG, "Face ID Enrollment: Take the %d%s sample",
                              ENROLL_CONFIRM_TIMES - left_sample_face,
                              number_suffix(ENROLL_CONFIRM_TIMES - left_sample_face));
 
                     if (left_sample_face == 0)
                     {
                         next_enroll_index++;
-                        ESP_LOGE(TAG, "Enrolled Face ID: %d", next_enroll_index);
+                        ESP_LOGI(TAG, "\nEnrolled Face ID: %d", id_list.tail);
 
-                        if (next_enroll_index == FACE_ID_SAVE_NUMBER)
+                        if (id_list.count == FACE_ID_SAVE_NUMBER)
                         {
                             is_enrolling = 0;
-                            ESP_LOGE(TAG, ">>> Face Recognition Starts <<<");
+                            ESP_LOGI(TAG, "\n>>> Face Recognition Starts <<<\n");
                             vTaskDelay(2000 / portTICK_PERIOD_MS);
                         }
                         else
                         {
-                            ESP_LOGE(TAG, "Please log in another one.");
+                            ESP_LOGI(TAG, "Please log in another one.");
                             vTaskDelay(2500 / portTICK_PERIOD_MS);
                         }
                     }
                 }
+                /* 6. Do face recognition */
                 else
                 {
                     int64_t recog_match_time = esp_timer_get_time();
 
-                    uint16_t matched_id = recognize_face(aligned_face,
-                                                         id_list,
-                                                         thresh,
-                                                         next_enroll_index);
-                    if (matched_id)
-                        ESP_LOGE(TAG, "Matched Face ID: %d", matched_id);
+                    int matched_id = recognize_face(&id_list, aligned_face);
+                    if (matched_id >= 0)
+                        ESP_LOGI(TAG, "Matched Face ID: %d\n", matched_id);
                     else
-                        ESP_LOGE(TAG, "No Matched Face ID");
+                        ESP_LOGI(TAG, "No Matched Face ID\n");
 
                     ESP_LOGI(TAG, "Recognition time consumption: %lldms",
                              (esp_timer_get_time() - recog_match_time) / 1000);
@@ -181,6 +187,7 @@ void task_process(void *arg)
                 ESP_LOGI(TAG, "Detected face is not proper.");
             }
 
+            free(net_boxes->score);
             free(net_boxes->box);
             free(net_boxes->landmark);
             free(net_boxes);
@@ -193,5 +200,6 @@ void task_process(void *arg)
 
 void app_facenet_main()
 {
+    face_id_init(&id_list, FACE_ID_SAVE_NUMBER, ENROLL_CONFIRM_TIMES);
     xTaskCreatePinnedToCore(task_process, "process", 4 * 1024, NULL, 5, NULL, 1);
 }
